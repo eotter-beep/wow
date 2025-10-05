@@ -16,10 +16,19 @@ except FileNotFoundError:
     print(f"Error: file '{path}' not found.")
     exit(1)
 
+# Strip out preprocessor directives which pycparser can't handle directly.
+sanitized_lines = []
+for line in content.splitlines():
+    if line.lstrip().startswith("#"):
+        sanitized_lines.append("")
+    else:
+        sanitized_lines.append(line)
+sanitized_content = "\n".join(sanitized_lines)
+
 # Parse C code into an AST
 parser = c_parser.CParser()
 try:
-    ast = parser.parse(content, filename=path)
+    ast = parser.parse(sanitized_content, filename=path)
 except Exception as e:
     print(f"Parsing error: {e}")
     exit(1)
