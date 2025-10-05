@@ -3,12 +3,24 @@
   The Wow! compiler — built by amazing people like eotter-beep
 """
 import os
-from pycparser import c_parser
+import re
+import shutil
+
+try:
+    import pycparser
+    from pycparser import c_parser
+except ModuleNotFoundError as exc:
+    print("Error: pycparser is required to run this compiler (pip install pycparser).")
+    raise SystemExit(1) from exc
+
+try:
+    import pycparser_fake_libc
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pycparser_fake_libc = None
 
 path = input("Enter a path (full path): ").strip()
 print(f"Compiling {path}...")
 
-# Safely read the file
 try:
     with open(path, "r") as f:
         content = f.read()
@@ -16,16 +28,88 @@ except FileNotFoundError:
     print(f"Error: file '{path}' not found.")
     exit(1)
 
-# Parse C code into an AST
-parser = c_parser.CParser()
+def find_fake_libc_dir():
+    candidates = [
+        os.path.join(os.path.dirname(pycparser.__file__), "utils", "fake_libc_include"),
+        os.path.join(os.path.dirname(pycparser.__file__), "fake_libc_include"),
+    ]
+
+    if pycparser_fake_libc is not None:
+        candidates.append(
+            os.path.join(os.path.dirname(pycparser_fake_libc.__file__), "fake_libc_include")
+        )
+        candidates.append(os.path.dirname(pycparser_fake_libc.__file__))
+
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+
+    return None
+
+
+fake_libc_dir = find_fake_libc_dir()
+cpp_path = shutil.which("cpp")
+cpp_args = [
+    "-nostdinc",
+    "-D__attribute__(x)=",
+    "-D__extension__=",
+    "-D__inline=inline",
+    "-D__inline__=inline",
+    "-D__asm(x)=",
+    "-D__asm__(x)=",
+    "-D__const=const",
+    "-D__volatile__=volatile",
+]
+
+if fake_libc_dir:
+    cpp_args.insert(1, f"-I{fake_libc_dir}")
+else:
+    print("Warning: falling back to simplified preprocessing because fake libc headers were not found.")
+    cpp_path = None
+
+if not cpp_path:
+    gcc_path = shutil.which("gcc")
+    if gcc_path:
+        cpp_path = gcc_path
+        cpp_args.insert(0, "-E")
+    else:
+        cpp_args = []
+
 try:
-    ast = parser.parse(content, filename=path)
+    if cpp_path:
+        ast = pycparser.parse_file(
+            path,
+            use_cpp=True,
+            cpp_path=cpp_path,
+            cpp_args=cpp_args,
+        )
+    else:
+        macros = {}
+        sanitized_lines = []
+        attribute_re = re.compile(r"__attribute__\s*\(\(.*?\)\)")
+        extension_re = re.compile(r"__extension__\b")
+
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#define"):
+                parts = stripped.split(maxsplit=2)
+                if len(parts) == 3 and "(" not in parts[1]:
+                    macros[parts[1]] = parts[2]
+                continue
+            if stripped.startswith("#"):
+                continue
+
+            line = attribute_re.sub("", line)
+            line = extension_re.sub("", line)
+            for name, value in macros.items():
+                line = re.sub(rf"\b{re.escape(name)}\b", value, line)
+            sanitized_lines.append(line)
+
+        sanitized_content = "\n".join(sanitized_lines)
+        parser = c_parser.CParser()
+        ast = parser.parse(sanitized_content, filename=path)
 except Exception as e:
     print(f"Parsing error: {e}")
     exit(1)
 
-# Display the AST
 ast.show()
-
-# (Optional) If you actually meant to run the file:
-# os.system(f'python3 "{path}"')
