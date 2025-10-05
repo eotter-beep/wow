@@ -3,29 +3,424 @@
   The Wow! compiler — built by amazing people like eotter-beep
 """
 import os
-from pycparser import c_parser
+import re
 
-path = input("Enter a path (full path): ").strip()
-print(f"Compiling {path}...")
-
-# Safely read the file
 try:
-    with open(path, "r") as f:
-        content = f.read()
-except FileNotFoundError:
-    print(f"Error: file '{path}' not found.")
-    exit(1)
+    import pycparser
+    from pycparser import c_parser
+except ModuleNotFoundError as exc:
+    print("Error: pycparser is required to run this compiler (pip install pycparser).")
+    raise SystemExit(1) from exc
 
-# Parse C code into an AST
-parser = c_parser.CParser()
 try:
-    ast = parser.parse(content, filename=path)
-except Exception as e:
-    print(f"Parsing error: {e}")
-    exit(1)
+    import pycparser_fake_libc
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pycparser_fake_libc = None
 
-# Display the AST
-ast.show()
+def find_fake_libc_dir():
+    candidates = [
+        os.path.join(os.path.dirname(pycparser.__file__), "utils", "fake_libc_include"),
+        os.path.join(os.path.dirname(pycparser.__file__), "fake_libc_include"),
+    ]
 
-# (Optional) If you actually meant to run the file:
-# os.system(f'python3 "{path}"')
+    if pycparser_fake_libc is not None:
+        candidates.append(
+            os.path.join(os.path.dirname(pycparser_fake_libc.__file__), "fake_libc_include")
+        )
+        candidates.append(os.path.dirname(pycparser_fake_libc.__file__))
+
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+
+    return None
+
+
+fake_libc_dir = find_fake_libc_dir()
+
+
+_ATTRIBUTE_RE = re.compile(r"__attribute__\s*\(\(.*?\)\)")
+_EXTENSION_RE = re.compile(r"__extension__\b")
+_ASM_RE = re.compile(r"__asm__?\s*\(.*?\)")
+
+
+def join_line_continuations(text):
+    lines = []
+    buffer = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.rstrip("\n")
+        if stripped.endswith("\\"):
+            buffer.append(stripped[:-1])
+            continue
+        if buffer:
+            buffer.append(stripped)
+            lines.append("".join(buffer))
+            buffer.clear()
+        else:
+            lines.append(stripped)
+    if buffer:
+        lines.append("".join(buffer))
+    return lines
+
+
+def strip_comments(text):
+    result = []
+    i = 0
+    in_block = False
+    in_string = None
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_block:
+            if ch == "*" and nxt == "/":
+                in_block = False
+                i += 2
+                continue
+            if ch == "\n":
+                result.append("\n")
+            i += 1
+            continue
+        if in_string:
+            result.append(ch)
+            prev = text[i - 1] if i > 0 else ""
+            if ch == in_string and prev != "\\":
+                in_string = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_string = ch
+            result.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            in_block = True
+            i += 2
+            continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def normalize_attributes(line):
+    return _ASM_RE.sub("", _EXTENSION_RE.sub("", _ATTRIBUTE_RE.sub("", line)))
+
+
+def split_macro_arguments(arg_text):
+    args = []
+    current = []
+    depth = 0
+    i = 0
+    while i < len(arg_text):
+        ch = arg_text[i]
+        if ch in ('"', "'"):
+            quote = ch
+            current.append(ch)
+            i += 1
+            while i < len(arg_text):
+                current.append(arg_text[i])
+                prev = arg_text[i - 1] if i > 0 else ""
+                if arg_text[i] == quote and prev != "\\":
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            if depth > 0:
+                depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            args.append("".join(current).strip())
+            current = []
+            i += 1
+            continue
+        else:
+            current.append(ch)
+        i += 1
+    if current:
+        args.append("".join(current).strip())
+    return args
+
+
+def expand_function_macro(line, name, params, body):
+    result = []
+    i = 0
+    while i < len(line):
+        match = re.search(rf"\b{re.escape(name)}\s*\(", line[i:])
+        if not match:
+            result.append(line[i:])
+            break
+        start = i + match.start()
+        result.append(line[i:start])
+        arg_start = start + len(match.group(0)) - 1
+        depth = 1
+        j = arg_start + 1
+        in_string = None
+        while j < len(line):
+            ch = line[j]
+            if in_string:
+                prev = line[j - 1] if j > 0 else ""
+                if ch == in_string and prev != "\\":
+                    in_string = None
+            else:
+                if ch in ('"', "'"):
+                    in_string = ch
+                elif ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+            j += 1
+        if depth != 0:
+            # Unmatched parentheses, leave as-is
+            result.append(line[start:])
+            break
+        raw_args = line[arg_start + 1 : j]
+        args = split_macro_arguments(raw_args)
+        if len(args) != len(params):
+            result.append(line[start : j + 1])
+            i = j + 1
+            continue
+        expanded = body
+        for param, value in zip(params, args):
+            expanded = re.sub(rf"\b{re.escape(param)}\b", value.strip(), expanded)
+        result.append(expanded)
+        i = j + 1
+    return "".join(result)
+
+
+def expand_macros(line, macros):
+    max_iterations = 10
+    for _ in range(max_iterations):
+        original = line
+        for name, definition in macros.items():
+            if definition["type"] == "object":
+                pattern = re.compile(rf"\b{re.escape(name)}\b")
+                line = pattern.sub(definition["value"], line)
+            else:
+                line = expand_function_macro(line, name, definition["params"], definition["body"])
+        if line == original:
+            break
+    return line
+
+
+def evaluate_condition(expr, macros):
+    def replace_defined(match):
+        name = match.group(1)
+        return "True" if name in macros else "False"
+
+    cleaned = re.sub(r"defined\s*\(\s*(\w+)\s*\)", replace_defined, expr)
+    cleaned = re.sub(r"defined\s+(\w+)", replace_defined, cleaned)
+    expanded = expand_macros(cleaned, macros)
+
+    def substitute_identifiers(match):
+        name = match.group(1)
+        if name in {"True", "False"}:
+            return name
+        return "True" if name in macros else "False"
+
+    expanded = re.sub(r"\b([A-Za-z_]\w*)\b", substitute_identifiers, expanded)
+    expanded = expanded.replace("&&", " and ").replace("||", " or ")
+    expanded = expanded.replace("!", " not ")
+
+    def replace_number(match):
+        return "True" if int(match.group(0)) != 0 else "False"
+
+    expanded = re.sub(r"\b\d+\b", replace_number, expanded)
+    try:
+        return bool(eval(expanded, {"__builtins__": {}}, {}))
+    except Exception:
+        return False
+
+
+def preprocess_content(path, content, macros, include_paths, include_stack):
+    stripped = strip_comments(content)
+    lines = join_line_continuations(stripped)
+    output = []
+    condition_stack = []
+
+    def overall_active():
+        return all(frame["active"] for frame in condition_stack) if condition_stack else True
+
+    include_re = re.compile(r"#\s*include\s*[<\"](.*?)[>\"]")
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#ifdef"):
+            name = stripped.split(None, 1)[1]
+            parent_active = overall_active()
+            active = parent_active and name in macros
+            condition_stack.append({
+                "parent": parent_active,
+                "active": active,
+                "seen_true": active,
+            })
+            continue
+        if stripped.startswith("#ifndef"):
+            name = stripped.split(None, 1)[1]
+            parent_active = overall_active()
+            active = parent_active and name not in macros
+            condition_stack.append({
+                "parent": parent_active,
+                "active": active,
+                "seen_true": active,
+            })
+            continue
+        if stripped.startswith("#if"):
+            expr = stripped[3:].strip()
+            parent_active = overall_active()
+            cond = evaluate_condition(expr, macros)
+            active = parent_active and cond
+            condition_stack.append({
+                "parent": parent_active,
+                "active": active,
+                "seen_true": active,
+            })
+            continue
+        if stripped.startswith("#elif") and condition_stack:
+            expr = stripped[5:].strip()
+            frame = condition_stack[-1]
+            if not frame["parent"]:
+                frame["active"] = False
+            elif frame["seen_true"]:
+                frame["active"] = False
+            else:
+                cond = evaluate_condition(expr, macros)
+                frame["active"] = cond and frame["parent"]
+                if frame["active"]:
+                    frame["seen_true"] = True
+            continue
+        if stripped.startswith("#else") and condition_stack:
+            frame = condition_stack[-1]
+            frame["active"] = frame["parent"] and not frame["seen_true"]
+            if frame["active"]:
+                frame["seen_true"] = True
+            continue
+        if stripped.startswith("#endif") and condition_stack:
+            condition_stack.pop()
+            continue
+
+        if not overall_active():
+            continue
+
+        if stripped.startswith("#include"):
+            match = include_re.match(stripped)
+            if match:
+                header = match.group(1)
+                candidate_paths = []
+                if os.path.isabs(header):
+                    candidate_paths.append(header)
+                else:
+                    for base in include_paths:
+                        candidate_paths.append(os.path.join(base, header))
+                for candidate in candidate_paths:
+                    if os.path.isfile(candidate):
+                        output.extend(
+                            preprocess_file(candidate, macros, include_paths, include_stack)
+                        )
+                        break
+            continue
+
+        if stripped.startswith("#define"):
+            parts = stripped.split(None, 2)
+            if len(parts) < 2:
+                continue
+            name_and_params = parts[1]
+            value = parts[2].strip() if len(parts) == 3 else "1"
+            func_match = re.match(r"(\w+)\s*\((.*)\)", name_and_params)
+            if func_match:
+                name = func_match.group(1)
+                param_text = func_match.group(2)
+                params = [p.strip() for p in param_text.split(",") if p.strip()]
+                macros[name] = {
+                    "type": "function",
+                    "params": tuple(params),
+                    "body": value,
+                }
+            else:
+                macros[name_and_params] = {"type": "object", "value": value}
+            continue
+
+        if stripped.startswith("#undef"):
+            name = stripped.split(None, 1)[1]
+            macros.pop(name, None)
+            continue
+
+        if stripped.startswith("#pragma"):
+            continue
+
+        if stripped.startswith("#error"):
+            message = stripped[6:].strip()
+            raise RuntimeError(f"Encountered #error directive: {message}")
+
+        expanded = expand_macros(line, macros)
+        normalized = normalize_attributes(expanded)
+        if normalized.strip():
+            output.append(normalized)
+    return output
+
+
+def preprocess_file(path, macros, include_paths, include_stack):
+    abs_path = os.path.abspath(path)
+    if abs_path in include_stack:
+        return []
+    include_stack.add(abs_path)
+    try:
+        with open(abs_path, "r") as handle:
+            content = handle.read()
+    except FileNotFoundError:
+        include_stack.discard(abs_path)
+        return []
+
+    directory = os.path.dirname(abs_path)
+    new_include_paths = [directory]
+    for existing in include_paths:
+        if existing not in new_include_paths:
+            new_include_paths.append(existing)
+    try:
+        return preprocess_content(abs_path, content, macros, new_include_paths, include_stack)
+    finally:
+        include_stack.discard(abs_path)
+
+
+def preprocess_translation_unit(entry_path, content):
+    macros = {}
+    include_paths = [os.path.dirname(os.path.abspath(entry_path))]
+    if fake_libc_dir and fake_libc_dir not in include_paths:
+        include_paths.append(fake_libc_dir)
+    include_stack = set()
+    lines = preprocess_content(entry_path, content, macros, include_paths, include_stack)
+    return "\n".join(lines)
+
+
+def main():
+    path = input("Enter a path (full path): ").strip()
+    print(f"Compiling {path}...")
+
+    try:
+        with open(path, "r") as f:
+            original_content = f.read()
+    except FileNotFoundError:
+        print(f"Error: file '{path}' not found.")
+        exit(1)
+
+    try:
+        sanitized_content = preprocess_translation_unit(path, original_content)
+        parser = c_parser.CParser()
+        ast = parser.parse(sanitized_content, filename=path)
+    except Exception as e:
+        print(f"Parsing error: {e}")
+        exit(1)
+
+    ast.show()
+
+
+if __name__ == "__main__":
+    main()
