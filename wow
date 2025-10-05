@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-  The Wow! compiler — built by amazing people like eotter-beep
+  The Wow! compiler — built by amazing people like eotter->
 """
 import os
 from pycparser import c_parser
@@ -16,7 +16,7 @@ except FileNotFoundError:
     print(f"Error: file '{path}' not found.")
     exit(1)
 
-# Strip out preprocessor directives which pycparser can't handle directly.
+# Strip out preprocessor directives which pycparser can't >
 sanitized_lines = []
 for line in content.splitlines():
     if line.lstrip().startswith("#"):
@@ -35,6 +35,4 @@ except Exception as e:
 
 # Display the AST
 ast.show()
-
-# (Optional) If you actually meant to run the file:
-# os.system(f'python3 "{path}"')
+os.system(f'python3 "{path}"')
