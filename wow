@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-  The Wow! compiler — built by amazing people like eotter-beep
+  The Wow! compiler — built by amazing people like eotter->
 """
 import os
 import re
